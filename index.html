@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Discord Ready Clip</title>
+  <meta name="description" content="Trim, crop and compress gameplay clips under 20 MB for Discord, right in your browser.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%235865F2'/><path d='M12 9v14l11-7z' fill='white'/></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="logo"><span class="logo-mark"></span>Discord Ready Clip</div>
+    <div class="tag">Runs in your browser · Nothing gets uploaded</div>
+  </header>
+
+  <main>
+    <section id="drop" class="drop">
+      <input type="file" id="file" accept="video/*,.mkv" hidden>
+      <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/></svg>
+      <h1>Drop your video here</h1>
+      <p class="or">or</p>
+      <button id="choose" class="btn primary">Choose Video</button>
+      <p id="dropError" class="error" hidden></p>
+    </section>
+
+    <section id="editor" class="editor" hidden>
+      <div id="stage" class="stage">
+        <video id="video" playsinline preload="auto"></video>
+        <div id="crop" class="crop" hidden>
+          <div class="h n" data-h="n"></div>
+          <div class="h s" data-h="s"></div>
+          <div class="h e" data-h="e"></div>
+          <div class="h w" data-h="w"></div>
+          <div class="h nw" data-h="nw"></div>
+          <div class="h ne" data-h="ne"></div>
+          <div class="h sw" data-h="sw"></div>
+          <div class="h se" data-h="se"></div>
+          <span id="cropSize" class="crop-size"></span>
+        </div>
+      </div>
+
+      <div class="transport">
+        <button id="play" class="play" aria-label="Play">
+          <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>
+          <svg class="i-pause" viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
+        </button>
+        <div id="timeline" class="timeline">
+          <div id="track" class="track">
+            <div id="range" class="range"></div>
+            <div id="hStart" class="handle start"></div>
+            <div id="hEnd" class="handle end"></div>
+            <div id="playhead" class="playhead"></div>
+          </div>
+        </div>
+        <span id="clock" class="clock">00:00 / 00:00</span>
+      </div>
+
+      <div class="row">
+        <label class="field"><span>Start</span><input id="start" inputmode="decimal" spellcheck="false" autocomplete="off"></label>
+        <span class="arrow">→</span>
+        <label class="field"><span>End</span><input id="end" inputmode="decimal" spellcheck="false" autocomplete="off"></label>
+        <span id="len" class="len"></span>
+        <div class="spacer"></div>
+        <button id="cropBtn" class="btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 2v14a2 2 0 0 0 2 2h14M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+          <span>Crop</span>
+        </button>
+        <button id="export" class="btn primary">Export Clip</button>
+      </div>
+
+      <div id="status" class="panel status" hidden>
+        <div class="bar"><div id="barFill" class="bar-fill"></div></div>
+        <div class="status-row">
+          <span id="statusText"></span>
+          <button id="cancel" class="link">Cancel</button>
+        </div>
+      </div>
+
+      <div id="result" class="panel result" hidden>
+        <div>
+          <div class="result-label">Ready for Discord</div>
+          <div id="resultInfo" class="result-info"></div>
+        </div>
+        <a id="download" class="btn primary" download>Download Video</a>
+      </div>
+
+      <div class="foot">
+        <span class="hint">Space play/pause · I / O set start / end at playhead</span>
+        <button id="another" class="link">Choose a different video</button>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
