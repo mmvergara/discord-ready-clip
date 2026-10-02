@@ -28,7 +28,7 @@ const cropEl = $('crop'), cropSize = $('cropSize'), cropBtn = $('cropBtn');
 const playBtn = $('play'), track = $('track'), range = $('range');
 const hStart = $('hStart'), hEnd = $('hEnd'), playhead = $('playhead'), clock = $('clock');
 const startIn = $('start'), endIn = $('end'), len = $('len');
-const exportBtn = $('export'), queueEl = $('queue'), another = $('another');
+const exportBtn = $('export'), exportMuteBtn = $('exportMute'), queueEl = $('queue'), another = $('another');
 
 let file = null;
 let duration = 0, selStart = 0, selEnd = 0;
@@ -363,9 +363,11 @@ async function probe(inst, file) {
   return probed;
 }
 
-// Bitrate that lands the whole file near TARGET_BYTES.
-function videoBitrateFor(dur, hasAudio) {
-  const totalBps = (TARGET_BYTES * 8 * 0.995) / dur; // MP4 overhead measured at well under 1%
+// Bitrate that lands the whole file near `target` bytes.
+const cropOnFor = (item) => item.src.w !== even(item.W) || item.src.h !== even(item.H);
+
+function videoBitrateFor(dur, hasAudio, target) {
+  const totalBps = (target * 8 * 0.995) / dur; // MP4 overhead measured at well under 1%
   return Math.max(150e3, totalBps - (hasAudio ? AUDIO_BPS : 0));
 }
 
@@ -385,12 +387,15 @@ const queue = [];
 let running = null;
 let nextId = 1;
 
-exportBtn.onclick = () => {
+exportBtn.onclick = () => queueClip(false);
+exportMuteBtn.onclick = () => queueClip(true);
+
+function queueClip(mute) {
   if (!file) return;
   video.pause();
   const item = {
     id: nextId++, file, W: video.videoWidth, H: video.videoHeight,
-    start: selStart, dur: round1(selEnd - selStart), src: cropPixels(),
+    start: selStart, dur: round1(selEnd - selStart), src: cropPixels(), srcDur: duration, mute,
     state: 'waiting', text: 'Waiting…', frac: null, url: null, info: '',
   };
   queue.push(item);
@@ -403,10 +408,11 @@ exportBtn.onclick = () => {
   renderItem(item);
   updateExportLabel();
   pump();
-};
+}
 
 function updateExportLabel() {
   exportBtn.textContent = running ? 'Add to Queue' : 'Export Clip';
+  exportMuteBtn.textContent = running ? 'Add Without Audio' : 'Export Without Audio';
 }
 
 function makeCard(item) {
@@ -424,7 +430,7 @@ function makeCard(item) {
     <div class="bar"><div class="bar-fill"></div></div>
     <div class="job-text"></div>`;
   el.querySelector('.job-title').textContent =
-    `${item.file.name.replace(/\.[^.]+$/, '')} · ${fmt(item.start)} → ${fmt(item.start + item.dur)}`;
+    `${item.file.name.replace(/\.[^.]+$/, '')} · ${fmt(item.start)} → ${fmt(item.start + item.dur)}${item.mute ? ' · no audio' : ''}`;
   el.querySelector('.job-x').onclick = () => removeItem(item);
   return el;
 }
@@ -443,7 +449,8 @@ function renderItem(item) {
   dl.hidden = !item.url;
   if (item.url) {
     dl.href = item.url;
-    dl.download = `${item.file.name.replace(/\.[^.]+$/, '')}-clip-${fmt(item.start).replace(/\D/g, '')}.mp4`;
+    dl.download = item.passthrough ? item.file.name
+      : `${item.file.name.replace(/\.[^.]+$/, '')}-clip-${fmt(item.start).replace(/\D/g, '')}.mp4`;
   }
 }
 
@@ -492,6 +499,19 @@ async function pump() {
 
 async function runItem(item) {
   const { start, dur, src } = item;
+  const untouched = !item.mute && !cropOnFor(item) && start <= 0.05 && dur >= item.srcDur - 0.15;
+
+  // Already small enough and nothing to trim or crop: hand the original file back untouched.
+  if (untouched && item.file.size <= TARGET_BYTES) {
+    item.state = 'done';
+    item.url = URL.createObjectURL(item.file);
+    item.passthrough = true;
+    item.info = `${(item.file.size / 1e6).toFixed(1)} MB · ${fmtLen(dur)} · ${item.W}×${item.H} · original, no re-encode`;
+    return renderItem(item);
+  }
+
+  // Never inflate: a clip of a small file only gets about as many bytes as that part had in the original.
+  const target = Math.min(TARGET_BYTES, Math.max(1e6, item.file.size * (dur / item.srcDur) * 1.1));
   const alive = () => { if (item.state === 'cancelled') throw new Error('cancelled'); };
   let inst = ff;
   if (!inst) {
@@ -501,10 +521,11 @@ async function runItem(item) {
   alive();
   setItem(item, 'Reading video…');
   await mountFile(inst, item.file);
-  const { fps, hasAudio } = await probe(inst, item.file);
+  const { fps } = await probe(inst, item.file);
+  const hasAudio = probed.hasAudio && !item.mute;
   alive();
 
-  let vbps = videoBitrateFor(dur, hasAudio);
+  let vbps = videoBitrateFor(dur, hasAudio, target);
   let best = null;      // largest encode that fit under MAX_BYTES
   let toppedUp = false;
   let lastUnder = true;
@@ -516,13 +537,13 @@ async function runItem(item) {
     const data = await encode(inst, item, { out, vbps, hasAudio, label });
 
     if (data.length <= MAX_BYTES && (!best || data.length > best.data.length)) best = { data, out };
-    if (best && (toppedUp || best.data.length >= TARGET_BYTES * UNDERSHOOT)) break;
+    if (best && (toppedUp || best.data.length >= target * UNDERSHOOT)) break;
 
     // Scale the bitrate by how far off we landed: up to fill unused space (once), down if over 20 MB.
     const under = data.length <= MAX_BYTES;
     if (under) toppedUp = true;
     lastUnder = under;
-    vbps *= (TARGET_BYTES / data.length) * (under ? 0.99 : 0.95);
+    vbps *= (target / data.length) * (under ? 0.99 : 0.95);
   }
   if (!best) throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
 
@@ -542,7 +563,7 @@ async function encode(inst, item, { out, vbps, hasAudio, label }) {
   const k = Math.round(vbps / 1000);
   const args = [
     '-ss', start.toFixed(3), '-i', inPath(item.file), '-t', dur.toFixed(3),
-    '-map', '0:v:0', '-map', '0:a:0?',
+    '-map', '0:v:0', ...(hasAudio ? ['-map', '0:a:0?'] : []),
     '-vf', filters.join(','),
     ...(useMT ? ['-threads', THREADS] : []),
     '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
