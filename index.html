@@ -11,7 +11,10 @@
 <body>
   <header class="top">
     <div class="logo"><span class="logo-mark"></span>Discord Ready Clip</div>
-    <div class="tag">Runs in your browser · Nothing gets uploaded</div>
+    <div class="top-right">
+      <div class="tag">Runs in your browser · Nothing gets uploaded</div>
+      <button id="another" class="btn danger" hidden>Choose a different video</button>
+    </div>
   </header>
 
   <main>
@@ -69,27 +72,12 @@
         <button id="export" class="btn primary">Export Clip</button>
       </div>
 
-      <div id="status" class="panel status" hidden>
-        <div class="bar"><div id="barFill" class="bar-fill"></div></div>
-        <div class="status-row">
-          <span id="statusText"></span>
-          <button id="cancel" class="link">Cancel</button>
-        </div>
-      </div>
-
-      <div id="result" class="panel result" hidden>
-        <div>
-          <div class="result-label">Ready for Discord</div>
-          <div id="resultInfo" class="result-info"></div>
-        </div>
-        <a id="download" class="btn primary" download>Download Video</a>
-      </div>
-
       <div class="foot">
         <span class="hint">Space play/pause · I / O set start / end at playhead</span>
-        <button id="another" class="link">Choose a different video</button>
       </div>
     </section>
+
+    <div id="queue" class="queue"></div>
   </main>
 
   <script type="module" src="app.js"></script>

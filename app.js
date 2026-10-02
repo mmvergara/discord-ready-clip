@@ -28,17 +28,12 @@ const cropEl = $('crop'), cropSize = $('cropSize'), cropBtn = $('cropBtn');
 const playBtn = $('play'), track = $('track'), range = $('range');
 const hStart = $('hStart'), hEnd = $('hEnd'), playhead = $('playhead'), clock = $('clock');
 const startIn = $('start'), endIn = $('end'), len = $('len');
-const exportBtn = $('export'), statusEl = $('status'), statusText = $('statusText');
-const bar = statusEl.querySelector('.bar'), barFill = $('barFill'), cancelBtn = $('cancel');
-const resultEl = $('result'), resultInfo = $('resultInfo'), download = $('download'), another = $('another');
+const exportBtn = $('export'), queueEl = $('queue'), another = $('another');
 
 let file = null;
 let duration = 0, selStart = 0, selEnd = 0;
 let cropOn = false;
 let crop = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 }; // normalized to the source frame
-let busy = false;
-let job = 0; // bumped on every export/cancel so stale work can tell it was abandoned
-let resultURL = null;
 
 /* ---------------- helpers ---------------- */
 
@@ -80,11 +75,10 @@ window.addEventListener('drop', (e) => {
 });
 
 function openFile(f) {
-  if (!f || busy) return;
+  if (!f) return;
   file = f;
   fileInput.value = '';
   dropError.hidden = true;
-  statusEl.hidden = resultEl.hidden = true;
   if (video.src) URL.revokeObjectURL(video.src);
   video.src = URL.createObjectURL(f);
   loadFFmpeg().catch(() => {}); // start fetching the encoder in the background
@@ -99,6 +93,7 @@ video.addEventListener('loadedmetadata', () => {
   video.currentTime = selStart;
   drop.hidden = true;
   editor.hidden = false;
+  another.hidden = false;
   render();
   renderCrop();
 });
@@ -274,6 +269,7 @@ let loadProgress = 0;
 let mounted = null;      // File currently mounted at /in
 let probed = null;       // { file, fps, hasAudio }
 let logLines = [];
+let logCount = 0;        // total lines ever logged (logLines is capped), used to detect stalls
 let onProgressLine = null;
 
 async function toBlobURL(url, type, expectedBytes) {
@@ -311,6 +307,7 @@ function loadFFmpeg() {
     const inst = new FFmpeg();
     inst.on('log', ({ message }) => {
       logLines.push(message);
+      logCount++;
       if (logLines.length > 300) logLines.shift();
       onProgressLine?.(message);
     });
@@ -330,15 +327,15 @@ function killFFmpeg() {
   mounted = null;
 }
 
-const inPath = () => `/in/${file.name}`;
+const inPath = (f) => `/in/${f.name}`;
 
-async function mountFile(inst) {
-  if (mounted === file) return;
+async function mountFile(inst, f) {
+  if (mounted === f) return;
   if (mounted) await inst.unmount('/in');
   else await inst.createDir('/in').catch(() => {});
   // WORKERFS reads straight from the File, so multi-GB recordings never get copied into memory.
-  await inst.mount('WORKERFS', { files: [file] }, '/in');
-  mounted = file;
+  await inst.mount('WORKERFS', { files: [f] }, '/in');
+  mounted = f;
 }
 
 class StallError extends Error {}
@@ -347,19 +344,19 @@ class StallError extends Error {}
 function execWatched(inst, args) {
   if (!useMT) return inst.exec(args);
   return new Promise((resolve, reject) => {
-    let seen = logLines.length, quietSince = performance.now();
+    let seen = logCount, quietSince = performance.now();
     const timer = setInterval(() => {
-      if (logLines.length !== seen) { seen = logLines.length; quietSince = performance.now(); }
+      if (logCount !== seen) { seen = logCount; quietSince = performance.now(); }
       else if (performance.now() - quietSince > STALL_MS) { clearInterval(timer); reject(new StallError('stalled')); }
     }, 1000);
     inst.exec(args).then(resolve, reject).finally(() => clearInterval(timer));
   });
 }
 
-async function probe(inst) {
+async function probe(inst, file) {
   if (probed?.file === file) return probed;
   logLines = [];
-  await execWatched(inst, ['-hide_banner', '-i', inPath()]); // "fails" (no output) but logs stream info
+  await execWatched(inst, ['-hide_banner', '-i', inPath(file)]); // "fails" (no output) but logs stream info
   const text = logLines.join('\n');
   const fps = parseFloat(text.match(/Video:.*?([\d.]+) fps/)?.[1]);
   probed = { file, fps: fps > 0 ? fps : 60, hasAudio: /Stream #.*Audio:/.test(text) };
@@ -380,97 +377,163 @@ function outputSize(src, vbps, fps) {
   return { w: even(src.w * s), h: even(src.h * s) };
 }
 
-/* ---------------- export ---------------- */
+/* ---------------- export queue ---------------- */
+// Clips encode one at a time (running two ffmpegs at once is no faster and risks running out of memory),
+// but you can keep editing and queue more while one is encoding.
 
-function setStatus(text, frac) {
-  statusEl.hidden = false;
-  statusEl.classList.remove('failed');
-  statusText.textContent = text;
-  bar.classList.toggle('indeterminate', frac == null);
-  barFill.style.width = frac == null ? '' : `${frac * 100}%`;
-}
+const queue = [];
+let running = null;
+let nextId = 1;
 
-function setBusy(b) {
-  busy = b;
-  exportBtn.disabled = b;
-  another.disabled = b;
-  cancelBtn.hidden = !b;
-}
-
-exportBtn.onclick = exportClip;
-
-cancelBtn.onclick = () => {
-  job++;
-  killFFmpeg();
-  statusEl.hidden = true;
-  setBusy(false);
+exportBtn.onclick = () => {
+  if (!file) return;
+  video.pause();
+  const item = {
+    id: nextId++, file, W: video.videoWidth, H: video.videoHeight,
+    start: selStart, dur: round1(selEnd - selStart), src: cropPixels(),
+    state: 'waiting', text: 'Waiting…', frac: null, url: null, info: '',
+  };
+  queue.push(item);
+  // Clip captured; go back to the upload screen so the next video can be picked while this one encodes.
+  editor.hidden = true;
+  another.hidden = true;
+  drop.hidden = false;
+  item.el = makeCard(item);
+  queueEl.prepend(item.el);
+  renderItem(item);
+  updateExportLabel();
+  pump();
 };
 
-async function exportClip() {
-  if (busy || !file) return;
-  const start = selStart, dur = round1(selEnd - selStart);
-  const src = cropPixels();
-  const id = ++job;
-  const cancelled = () => id !== job;
-  resultEl.hidden = true;
-  setBusy(true);
-  video.pause();
+function updateExportLabel() {
+  exportBtn.textContent = running ? 'Add to Queue' : 'Export Clip';
+}
 
-  try {
-    let inst = ff;
-    if (!inst) {
-      const timer = setInterval(() => setStatus(`Loading video encoder… ${Math.round(loadProgress * 100)}%`, loadProgress), 200);
-      try { inst = await loadFFmpeg(); } finally { clearInterval(timer); }
-    }
-    if (cancelled()) return;
+function makeCard(item) {
+  const el = document.createElement('div');
+  el.className = 'panel job';
+  el.innerHTML = `
+    <div class="job-head">
+      <div class="job-title"></div>
+      <div class="job-actions">
+        <a class="btn primary job-dl" hidden>Download Video</a>
+        <button class="link job-x"></button>
+      </div>
+    </div>
+    <div class="job-info"></div>
+    <div class="bar"><div class="bar-fill"></div></div>
+    <div class="job-text"></div>`;
+  el.querySelector('.job-title').textContent =
+    `${item.file.name.replace(/\.[^.]+$/, '')} · ${fmt(item.start)} → ${fmt(item.start + item.dur)}`;
+  el.querySelector('.job-x').onclick = () => removeItem(item);
+  return el;
+}
 
-    setStatus('Reading video…');
-    await mountFile(inst);
-    const { fps, hasAudio } = await probe(inst);
-
-    let vbps = videoBitrateFor(dur, hasAudio);
-    let best = null;      // largest encode that fit under MAX_BYTES
-    let toppedUp = false;
-    let lastUnder = true;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const out = outputSize(src, vbps, fps);
-      const label = attempt === 1 ? 'Encoding'
-        : lastUnder ? 'Using the leftover space for better quality, re-encoding'
-        : `Too big, re-encoding at a lower bitrate (try ${attempt})`;
-      const data = await encode(inst, { start, dur, src, out, vbps, hasAudio, label });
-      if (cancelled()) return;
-
-      if (data.length <= MAX_BYTES && (!best || data.length > best.data.length)) best = { data, out };
-      if (best && (toppedUp || best.data.length >= TARGET_BYTES * UNDERSHOOT)) break;
-
-      // Scale the bitrate by how far off we landed: up to fill unused space (once), down if over 20 MB.
-      const under = data.length <= MAX_BYTES;
-      if (under) toppedUp = true;
-      lastUnder = under;
-      vbps *= (TARGET_BYTES / data.length) * (under ? 0.99 : 0.95);
-    }
-    if (best) return showResult(best.data, dur, best.out);
-    throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
-  } catch (err) {
-    if (cancelled()) return;
-    if (useMT && (err instanceof StallError || /SharedArrayBuffer|load/i.test(err.message))) {
-      // Multi-threaded core hung or wouldn't start: switch to the single-threaded core and start over.
-      console.warn('Multi-threaded ffmpeg failed, falling back to single-threaded:', err);
-      useMT = false;
-      killFFmpeg();
-      setBusy(false);
-      return exportClip();
-    }
-    console.error(err);
-    setStatus(`Export failed: ${err.message || err}`);
-    statusEl.classList.add('failed');
-  } finally {
-    if (!cancelled()) setBusy(false);
+function renderItem(item) {
+  const el = item.el;
+  el.dataset.state = item.state;
+  const active = item.state === 'waiting' || item.state === 'encoding';
+  el.querySelector('.bar').hidden = item.state !== 'encoding';
+  el.querySelector('.bar').classList.toggle('indeterminate', active && item.frac == null);
+  el.querySelector('.bar-fill').style.width = item.frac == null ? '' : `${item.frac * 100}%`;
+  el.querySelector('.job-text').textContent = item.state === 'done' ? '' : item.text;
+  el.querySelector('.job-info').textContent = item.info;
+  el.querySelector('.job-x').textContent = active ? 'Cancel' : 'Remove';
+  const dl = el.querySelector('.job-dl');
+  dl.hidden = !item.url;
+  if (item.url) {
+    dl.href = item.url;
+    dl.download = `${item.file.name.replace(/\.[^.]+$/, '')}-clip-${fmt(item.start).replace(/\D/g, '')}.mp4`;
   }
 }
 
-async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
-  const W = video.videoWidth, H = video.videoHeight;
+function setItem(item, text, frac = null) {
+  item.text = text;
+  item.frac = frac;
+  renderItem(item);
+}
+
+function removeItem(item) {
+  queue.splice(queue.indexOf(item), 1);
+  item.el.remove();
+  if (item.url) URL.revokeObjectURL(item.url);
+  if (item === running) {
+    item.state = 'cancelled';
+    killFFmpeg(); // the in-flight exec rejects; pump() moves on
+  }
+}
+
+async function pump() {
+  if (running) return;
+  const item = queue.find((q) => q.state === 'waiting');
+  if (!item) return updateExportLabel();
+  running = item;
+  item.state = 'encoding';
+  updateExportLabel();
+  try {
+    await runItem(item);
+  } catch (err) {
+    if (item.state === 'cancelled') { /* removed by the user */ }
+    else if (useMT && (err instanceof StallError || /SharedArrayBuffer|load/i.test(err.message))) {
+      // Multi-threaded core hung or wouldn't start: switch to the single-threaded core and redo this clip.
+      console.warn('Multi-threaded ffmpeg failed, falling back to single-threaded:', err);
+      useMT = false;
+      killFFmpeg();
+      item.state = 'waiting';
+    } else {
+      console.error(err);
+      item.state = 'failed';
+      setItem(item, `Export failed: ${err.message || err}`);
+    }
+  }
+  running = null;
+  pump();
+}
+
+async function runItem(item) {
+  const { start, dur, src } = item;
+  const alive = () => { if (item.state === 'cancelled') throw new Error('cancelled'); };
+  let inst = ff;
+  if (!inst) {
+    const timer = setInterval(() => setItem(item, `Loading video encoder… ${Math.round(loadProgress * 100)}%`, loadProgress), 200);
+    try { inst = await loadFFmpeg(); } finally { clearInterval(timer); }
+  }
+  alive();
+  setItem(item, 'Reading video…');
+  await mountFile(inst, item.file);
+  const { fps, hasAudio } = await probe(inst, item.file);
+  alive();
+
+  let vbps = videoBitrateFor(dur, hasAudio);
+  let best = null;      // largest encode that fit under MAX_BYTES
+  let toppedUp = false;
+  let lastUnder = true;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const out = outputSize(src, vbps, fps);
+    const label = attempt === 1 ? 'Encoding'
+      : lastUnder ? 'Using the leftover space for better quality, re-encoding'
+      : `Too big, re-encoding at a lower bitrate (try ${attempt})`;
+    const data = await encode(inst, item, { out, vbps, hasAudio, label });
+
+    if (data.length <= MAX_BYTES && (!best || data.length > best.data.length)) best = { data, out };
+    if (best && (toppedUp || best.data.length >= TARGET_BYTES * UNDERSHOOT)) break;
+
+    // Scale the bitrate by how far off we landed: up to fill unused space (once), down if over 20 MB.
+    const under = data.length <= MAX_BYTES;
+    if (under) toppedUp = true;
+    lastUnder = under;
+    vbps *= (TARGET_BYTES / data.length) * (under ? 0.99 : 0.95);
+  }
+  if (!best) throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
+
+  item.state = 'done';
+  item.url = URL.createObjectURL(new Blob([best.data], { type: 'video/mp4' }));
+  item.info = `${(best.data.length / 1e6).toFixed(1)} MB · ${fmtLen(dur)} · ${best.out.w}×${best.out.h}`;
+  renderItem(item);
+}
+
+async function encode(inst, item, { out, vbps, hasAudio, label }) {
+  const { start, dur, src, W, H } = item;
   const filters = [];
   if (src.w !== W || src.h !== H) filters.push(`crop=${src.w}:${src.h}:${src.x}:${src.y}`);
   if (out.w !== src.w || out.h !== src.h) filters.push(`scale=${out.w}:${out.h}`);
@@ -478,7 +541,7 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
 
   const k = Math.round(vbps / 1000);
   const args = [
-    '-ss', start.toFixed(3), '-i', inPath(), '-t', dur.toFixed(3),
+    '-ss', start.toFixed(3), '-i', inPath(item.file), '-t', dur.toFixed(3),
     '-map', '0:v:0', '-map', '0:a:0?',
     '-vf', filters.join(','),
     ...(useMT ? ['-threads', THREADS] : []),
@@ -489,7 +552,7 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
   ];
 
   const t0 = performance.now();
-  setStatus(`${label}… 0%`, 0);
+  setItem(item, `${label}… 0%`, 0);
   onProgressLine = (msg) => {
     const m = msg.match(/time=(\d+):(\d+):([\d.]+)/);
     if (!m) return;
@@ -497,7 +560,7 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
     const elapsed = (performance.now() - t0) / 1000;
     const left = frac > 0.03 ? Math.round(elapsed / frac - elapsed) : null;
     const eta = left == null ? '' : left >= 60 ? ` · about ${Math.ceil(left / 60)} min left` : ` · ${left}s left`;
-    setStatus(`${label}… ${Math.round(frac * 100)}%${eta}`, frac);
+    setItem(item, `${label}… ${Math.round(frac * 100)}%${eta}`, frac);
   };
 
   logLines = [];
@@ -510,14 +573,4 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
   const data = await inst.readFile('/out.mp4');
   await inst.deleteFile('/out.mp4');
   return data;
-}
-
-function showResult(data, dur, out) {
-  if (resultURL) URL.revokeObjectURL(resultURL);
-  resultURL = URL.createObjectURL(new Blob([data], { type: 'video/mp4' }));
-  download.href = resultURL;
-  download.download = `${file.name.replace(/\.[^.]+$/, '')}-clip.mp4`;
-  resultInfo.textContent = `${(data.length / 1e6).toFixed(1)} MB · ${fmtLen(dur)} · ${out.w}×${out.h}`;
-  statusEl.hidden = true;
-  resultEl.hidden = false;
 }
