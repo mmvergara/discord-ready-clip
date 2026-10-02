@@ -6,11 +6,11 @@ Upload → Trim → Crop → Compress → Download. A static page that cuts a Sh
 
 - `index.html`, `style.css`, `app.js`: the whole app
 - `vendor/ffmpeg/`: `@ffmpeg/ffmpeg@0.12.15` ESM build, served same-origin so its Web Worker can load
-- The ffmpeg core (`@ffmpeg/core@0.12.10`, ~32 MB) is fetched from jsDelivr on first use and cached by the browser
+- The ffmpeg core (~32 MB) is fetched from jsDelivr on first use and cached by the browser. When the page is cross-origin isolated (the COOP/COEP headers in `vercel.json`), it uses the multi-threaded `@ffmpeg/core-mt` (about 2x faster); otherwise, or if that core stalls, it falls back to the single-threaded `@ffmpeg/core`
 
 ## Run locally
 
-Any static server works, e.g. `python3 -m http.server 8000`, then open http://localhost:8000.
+Any static server works, e.g. `python3 -m http.server 8000`, then open http://localhost:8000. Plain servers don't send the COOP/COEP headers, so locally it runs the slower single-threaded core; `npx vercel dev` applies them.
 
 ## Deploy to Vercel
 

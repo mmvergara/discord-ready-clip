@@ -1,8 +1,16 @@
 import { FFmpeg } from './vendor/ffmpeg/index.js';
 
-// ffmpeg core (single-threaded, no special headers needed). Pinned so the exact size is known.
-const CORE_BASE = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
-const CORE_WASM_BYTES = 32232419;
+// ffmpeg cores, pinned so the exact sizes are known. The multi-threaded core is ~2x faster but needs
+// SharedArrayBuffer (cross-origin isolation via the headers in vercel.json) and occasionally deadlocks,
+// so we fall back to the single-threaded core when it isn't available or stalls.
+const CORES = {
+  mt: { base: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.10/dist/esm', wasmBytes: 32718323 },
+  st: { base: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm', wasmBytes: 32232419 },
+};
+// The mt core pre-spawns 32 pthreads; x264's automatic thread count can exceed that and hang, so cap it.
+const THREADS = String(Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4)));
+const STALL_MS = 45000;      // no ffmpeg output for this long = assume the mt core deadlocked
+let useMT = self.crossOriginIsolated === true;
 
 const TARGET_BYTES = 18e6;   // aim for ~18 MB
 const MAX_BYTES = 20e6;      // never exceed 20 MB
@@ -11,6 +19,7 @@ const MIN_BPP = 0.06;        // below this many bits/pixel/frame, downscale inst
 const MIN_HEIGHT = 360;
 const MIN_CLIP = 0.5;
 const MAX_ATTEMPTS = 5;
+const UNDERSHOOT = 0.94;   // if a clip lands under ~17 MB, re-encode once at a higher bitrate
 
 const $ = (id) => document.getElementById(id);
 const drop = $('drop'), fileInput = $('file'), dropError = $('dropError');
@@ -260,7 +269,7 @@ cropEl.addEventListener('pointerdown', (e) => {
 
 let ff = null;           // loaded FFmpeg instance
 let ffLoading = null;    // promise for the instance
-let coreURLs = null;     // promise for blob URLs of the core (downloaded once per page load)
+let coreURLs = null;     // { mt, promise } for blob URLs of the core (downloaded once per page load)
 let loadProgress = 0;
 let mounted = null;      // File currently mounted at /in
 let probed = null;       // { file, fps, hasAudio }
@@ -284,20 +293,28 @@ async function toBlobURL(url, type, expectedBytes) {
 }
 
 function loadFFmpeg() {
-  coreURLs ??= Promise.all([
-    toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
-    toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm', CORE_WASM_BYTES),
-  ]).catch((err) => { coreURLs = null; throw err; });
+  if (coreURLs?.mt !== useMT) {
+    const { base, wasmBytes } = useMT ? CORES.mt : CORES.st;
+    loadProgress = 0;
+    const promise = Promise.all([
+      toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
+      toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm', wasmBytes),
+      useMT ? toBlobURL(`${base}/ffmpeg-core.worker.js`, 'text/javascript') : undefined,
+    ]);
+    coreURLs = { mt: useMT, promise };
+    promise.catch(() => { if (coreURLs?.promise === promise) coreURLs = null; });
+  }
+  const urls = coreURLs.promise;
 
   ffLoading ??= (async () => {
-    const [coreURL, wasmURL] = await coreURLs;
+    const [coreURL, wasmURL, workerURL] = await urls;
     const inst = new FFmpeg();
     inst.on('log', ({ message }) => {
       logLines.push(message);
       if (logLines.length > 300) logLines.shift();
       onProgressLine?.(message);
     });
-    await inst.load({ coreURL, wasmURL });
+    await inst.load(workerURL ? { coreURL, wasmURL, workerURL } : { coreURL, wasmURL });
     ff = inst;
     mounted = null;
     return inst;
@@ -324,10 +341,25 @@ async function mountFile(inst) {
   mounted = file;
 }
 
+class StallError extends Error {}
+
+// Runs ffmpeg, but gives up if it goes silent for STALL_MS (the mt core can deadlock instead of failing).
+function execWatched(inst, args) {
+  if (!useMT) return inst.exec(args);
+  return new Promise((resolve, reject) => {
+    let seen = logLines.length, quietSince = performance.now();
+    const timer = setInterval(() => {
+      if (logLines.length !== seen) { seen = logLines.length; quietSince = performance.now(); }
+      else if (performance.now() - quietSince > STALL_MS) { clearInterval(timer); reject(new StallError('stalled')); }
+    }, 1000);
+    inst.exec(args).then(resolve, reject).finally(() => clearInterval(timer));
+  });
+}
+
 async function probe(inst) {
   if (probed?.file === file) return probed;
   logLines = [];
-  await inst.exec(['-hide_banner', '-i', inPath()]); // "fails" (no output) but logs stream info
+  await execWatched(inst, ['-hide_banner', '-i', inPath()]); // "fails" (no output) but logs stream info
   const text = logLines.join('\n');
   const fps = parseFloat(text.match(/Video:.*?([\d.]+) fps/)?.[1]);
   probed = { file, fps: fps > 0 ? fps : 60, hasAudio: /Stream #.*Audio:/.test(text) };
@@ -336,7 +368,7 @@ async function probe(inst) {
 
 // Bitrate that lands the whole file near TARGET_BYTES.
 function videoBitrateFor(dur, hasAudio) {
-  const totalBps = (TARGET_BYTES * 8 * 0.98) / dur; // ~2% MP4 container overhead
+  const totalBps = (TARGET_BYTES * 8 * 0.995) / dur; // MP4 overhead measured at well under 1%
   return Math.max(150e3, totalBps - (hasAudio ? AUDIO_BPS : 0));
 }
 
@@ -397,18 +429,38 @@ async function exportClip() {
     const { fps, hasAudio } = await probe(inst);
 
     let vbps = videoBitrateFor(dur, hasAudio);
+    let best = null;      // largest encode that fit under MAX_BYTES
+    let toppedUp = false;
+    let lastUnder = true;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       const out = outputSize(src, vbps, fps);
-      const data = await encode(inst, { start, dur, src, out, vbps, hasAudio, attempt });
+      const label = attempt === 1 ? 'Encoding'
+        : lastUnder ? 'Using the leftover space for better quality, re-encoding'
+        : `Too big, re-encoding at a lower bitrate (try ${attempt})`;
+      const data = await encode(inst, { start, dur, src, out, vbps, hasAudio, label });
       if (cancelled()) return;
 
-      if (data.length <= MAX_BYTES) return showResult(data, dur, out);
-      // Too big: scale the bitrate by how far over we were, with a little extra margin.
-      vbps *= (TARGET_BYTES / data.length) * 0.95;
+      if (data.length <= MAX_BYTES && (!best || data.length > best.data.length)) best = { data, out };
+      if (best && (toppedUp || best.data.length >= TARGET_BYTES * UNDERSHOOT)) break;
+
+      // Scale the bitrate by how far off we landed: up to fill unused space (once), down if over 20 MB.
+      const under = data.length <= MAX_BYTES;
+      if (under) toppedUp = true;
+      lastUnder = under;
+      vbps *= (TARGET_BYTES / data.length) * (under ? 0.99 : 0.95);
     }
+    if (best) return showResult(best.data, dur, best.out);
     throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
   } catch (err) {
     if (cancelled()) return;
+    if (useMT && (err instanceof StallError || /SharedArrayBuffer|load/i.test(err.message))) {
+      // Multi-threaded core hung or wouldn't start: switch to the single-threaded core and start over.
+      console.warn('Multi-threaded ffmpeg failed, falling back to single-threaded:', err);
+      useMT = false;
+      killFFmpeg();
+      setBusy(false);
+      return exportClip();
+    }
     console.error(err);
     setStatus(`Export failed: ${err.message || err}`);
     statusEl.classList.add('failed');
@@ -417,7 +469,7 @@ async function exportClip() {
   }
 }
 
-async function encode(inst, { start, dur, src, out, vbps, hasAudio, attempt }) {
+async function encode(inst, { start, dur, src, out, vbps, hasAudio, label }) {
   const W = video.videoWidth, H = video.videoHeight;
   const filters = [];
   if (src.w !== W || src.h !== H) filters.push(`crop=${src.w}:${src.h}:${src.x}:${src.y}`);
@@ -429,13 +481,13 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, attempt }) {
     '-ss', start.toFixed(3), '-i', inPath(), '-t', dur.toFixed(3),
     '-map', '0:v:0', '-map', '0:a:0?',
     '-vf', filters.join(','),
+    ...(useMT ? ['-threads', THREADS] : []),
     '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
     '-b:v', `${k}k`, '-maxrate', `${Math.round(k * 1.5)}k`, '-bufsize', `${k * 2}k`,
     ...(hasAudio ? ['-c:a', 'aac', '-b:a', `${AUDIO_BPS / 1000}k`, '-ac', '2'] : []),
     '-movflags', '+faststart', '-y', '/out.mp4',
   ];
 
-  const label = attempt === 1 ? 'Encoding' : `Too big, re-encoding at a lower bitrate (try ${attempt})`;
   const t0 = performance.now();
   setStatus(`${label}… 0%`, 0);
   onProgressLine = (msg) => {
@@ -450,7 +502,7 @@ async function encode(inst, { start, dur, src, out, vbps, hasAudio, attempt }) {
 
   logLines = [];
   let code;
-  try { code = await inst.exec(args); } finally { onProgressLine = null; }
+  try { code = await execWatched(inst, args); } finally { onProgressLine = null; }
   if (code !== 0) {
     const detail = logLines.filter((l) => /error|invalid|failed/i.test(l)).pop() || `ffmpeg exited with code ${code}`;
     throw new Error(detail);
