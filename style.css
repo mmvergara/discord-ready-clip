@@ -161,7 +161,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 0 16px 48px; }
   position: absolute; top: -6px; bottom: -6px; width: 2px; margin-left: -1px;
   background: #fff; border-radius: 1px; pointer-events: none; box-shadow: 0 0 0 1px rgba(0,0,0,.35);
 }
-.clock { flex: none; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; min-width: 96px; text-align: right; }
+.clock { flex: none; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; width: 18ch; text-align: right; white-space: nowrap; }
 
 /* ---------- Controls row ---------- */
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

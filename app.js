@@ -24,8 +24,6 @@ const AUDIO_BPS = 128e3;
 const MIN_BPP = 0.06;        // below this many bits/pixel/frame, downscale instead of starving quality
 const MIN_HEIGHT = 360;
 const MIN_CLIP = 0.5;
-const MAX_ATTEMPTS = 5;
-const UNDERSHOOT = 0.94;   // if a clip lands under ~17 MB, re-encode once at a higher bitrate
 
 const $ = (id) => document.getElementById(id);
 const drop = $('drop'), fileInput = $('file'), dropError = $('dropError');
@@ -543,26 +541,17 @@ async function runItem(item) {
   alive();
 
   let vbps = videoBitrateFor(dur, hasAudio, target);
-  let best = null;      // largest encode that fit under MAX_BYTES
-  let toppedUp = false;
-  let lastUnder = true;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const out = outputSize(src, vbps, fps);
-    const label = attempt === 1 ? 'Encoding'
-      : lastUnder ? 'Using the leftover space for better quality, re-encoding'
-      : `Too big, re-encoding at a lower bitrate (try ${attempt})`;
-    const data = await encode(inst, item, { out, vbps, hasAudio, label });
-
-    if (data.length <= MAX_BYTES && (!best || data.length > best.data.length)) best = { data, out };
-    if (best && (toppedUp || best.data.length >= target * UNDERSHOOT)) break;
-
-    // Scale the bitrate by how far off we landed: up to fill unused space (once), down if over 20 MB.
-    const under = data.length <= MAX_BYTES;
-    if (under) toppedUp = true;
-    lastUnder = under;
-    vbps *= (target / data.length) * (under ? 0.99 : 0.95);
+  // One encode, aimed at TARGET_BYTES so it normally lands under MAX_BYTES. Only if it overshoots,
+  // retry once at a bitrate scaled down by how far over it went.
+  let out = outputSize(src, vbps, fps);
+  let data = await encode(inst, item, { out, vbps, hasAudio, label: 'Encoding' });
+  if (data.length > MAX_BYTES) {
+    vbps *= (target / data.length) * 0.92;
+    out = outputSize(src, vbps, fps);
+    data = await encode(inst, item, { out, vbps, hasAudio, label: 'Too big, re-encoding at a lower bitrate' });
   }
-  if (!best) throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
+  if (data.length > MAX_BYTES) throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
+  const best = { data, out };
 
   item.state = 'done';
   item.url = URL.createObjectURL(new Blob([best.data], { type: 'video/mp4' }));
