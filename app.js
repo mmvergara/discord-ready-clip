@@ -18,6 +18,12 @@ function readMTFailed() {
   try { return localStorage.getItem(MT_FAILED_KEY) === '1'; } catch { return false; }
 }
 
+// Mediabunny drives WebCodecs (hardware encoder when the GPU has one) for trim/crop/scale/encode/mux.
+// When the browser can't do it, exports fall back to ffmpeg.wasm.
+const MEDIABUNNY_URL = 'https://cdn.jsdelivr.net/npm/mediabunny@1.61.0/dist/bundles/mediabunny.min.mjs';
+let mediabunny = null;
+let webCodecsOK = typeof VideoEncoder === 'function';
+
 const TARGET_BYTES = 18e6;   // aim for ~18 MB
 const MAX_BYTES = 20e6;      // never exceed 20 MB
 const AUDIO_BPS = 128e3;
@@ -480,6 +486,7 @@ function removeItem(item) {
   if (item.url) URL.revokeObjectURL(item.url);
   if (item === running) {
     item.state = 'cancelled';
+    item.conversion?.cancel().catch(() => {});
     killFFmpeg(); // the in-flight exec rejects; pump() moves on
   }
 }
@@ -528,6 +535,99 @@ async function runItem(item) {
   // Never inflate: a clip of a small file only gets about as many bytes as that part had in the original.
   const target = Math.min(TARGET_BYTES, Math.max(1e6, item.file.size * (dur / item.srcDur) * 1.1));
   const alive = () => { if (item.state === 'cancelled') throw new Error('cancelled'); };
+
+  let best = null;
+  if (webCodecsOK) {
+    try {
+      best = await runWebCodecs(item, target, alive);
+    } catch (err) {
+      alive();
+      if (err instanceof SizeError) throw err; // ffmpeg wouldn't do better
+      console.warn('WebCodecs export failed, falling back to ffmpeg:', err);
+    }
+    if (!best) webCodecsOK = false; // don't retry a path that this browser can't do
+  }
+  if (!best) best = await runFFmpeg(item, target, alive);
+
+  item.state = 'done';
+  item.url = URL.createObjectURL(new Blob([best.data], { type: 'video/mp4' }));
+  item.info = `${(best.data.length / 1e6).toFixed(1)} MB · ${fmtLen(dur)} · ${best.out.w}×${best.out.h}`;
+  renderItem(item);
+}
+
+class SizeError extends Error {}
+
+// Encodes once at the bitrate that should land near `target`; if that overshoots MAX_BYTES, retries once
+// at a bitrate scaled down by how far over it went. `encodeAt` returns the file bytes.
+async function encodeToSize(item, target, fps, hasAudio, encodeAt) {
+  let vbps = videoBitrateFor(item.dur, hasAudio, target);
+  let out = outputSize(item.src, vbps, fps);
+  let data = await encodeAt(out, vbps, 'Encoding');
+  if (data.length > MAX_BYTES) {
+    vbps *= (target / data.length) * 0.92;
+    out = outputSize(item.src, vbps, fps);
+    data = await encodeAt(out, vbps, 'Too big, re-encoding at a lower bitrate');
+  }
+  if (data.length > MAX_BYTES) throw new SizeError("Couldn't get the clip under 20 MB. Try a shorter selection.");
+  return { data, out };
+}
+
+// Returns null when this browser can't encode the clip with WebCodecs.
+async function runWebCodecs(item, target, alive) {
+  const { start, dur, src, W, H } = item;
+  setItem(item, 'Reading video…');
+  mediabunny ??= await import(MEDIABUNNY_URL);
+  const { Input, Output, Conversion, BlobSource, BufferTarget, Mp4OutputFormat, ALL_FORMATS, Quality,
+    canEncodeVideo, canEncodeAudio } = mediabunny;
+  alive();
+
+  const input = new Input({ source: new BlobSource(item.file), formats: ALL_FORMATS });
+  const vTrack = await input.getPrimaryVideoTrack();
+  if (!vTrack) return null;
+  const stats = await vTrack.computePacketStats(120);
+  const fps = stats.averagePacketRate > 0 ? stats.averagePacketRate : 60;
+  const hasAudio = !item.mute && !!(await input.getPrimaryAudioTrack());
+  if (hasAudio && !(await canEncodeAudio('aac', { bitrate: AUDIO_BPS }))) return null;
+  alive();
+
+  const cropOn = src.w !== W || src.h !== H;
+  return encodeToSize(item, target, fps, hasAudio, async (out, vbps, label) => {
+    if (!(await canEncodeVideo('avc', { width: out.w, height: out.h, bitrate: vbps }))) {
+      throw new Error(`can't encode H.264 at ${out.w}×${out.h}`);
+    }
+    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
+    const conversion = await Conversion.init({
+      input, output, tracks: 'primary',
+      trim: { start, end: start + dur },
+      video: {
+        codec: 'avc', forceTranscode: true, fit: 'fill', width: out.w, height: out.h,
+        ...(cropOn ? { crop: { left: src.x, top: src.y, width: src.w, height: src.h } } : {}),
+        quality: new Quality({ bitrate: Math.round(vbps), bitrateMode: 'variable' }),
+      },
+      audio: hasAudio
+        ? { codec: 'aac', numberOfChannels: 2, quality: new Quality({ bitrate: AUDIO_BPS }) }
+        : { discard: true },
+    });
+    if (!conversion.isValid) {
+      throw new Error(`conversion invalid: ${conversion.discardedTracks.map((d) => d.reason).join(', ')}`);
+    }
+    const t0 = performance.now();
+    setItem(item, `${label}… 0%`, 0);
+    conversion.onProgress = (frac) => setItem(item, `${label}… ${Math.round(frac * 100)}%${etaText(t0, frac)}`, frac);
+    item.conversion = conversion;
+    try { await conversion.execute(); } finally { item.conversion = null; }
+    alive();
+    return new Uint8Array(output.target.buffer);
+  });
+}
+
+function etaText(t0, frac) {
+  const elapsed = (performance.now() - t0) / 1000;
+  const left = frac > 0.03 ? Math.round(elapsed / frac - elapsed) : null;
+  return left == null ? '' : left >= 60 ? ` · about ${Math.ceil(left / 60)} min left` : ` · ${left}s left`;
+}
+
+async function runFFmpeg(item, target, alive) {
   let inst = ff;
   if (!inst) {
     const timer = setInterval(() => setItem(item, `Loading video encoder… ${Math.round(loadProgress * 100)}%`, loadProgress), 200);
@@ -540,23 +640,8 @@ async function runItem(item) {
   const hasAudio = probed.hasAudio && !item.mute;
   alive();
 
-  let vbps = videoBitrateFor(dur, hasAudio, target);
-  // One encode, aimed at TARGET_BYTES so it normally lands under MAX_BYTES. Only if it overshoots,
-  // retry once at a bitrate scaled down by how far over it went.
-  let out = outputSize(src, vbps, fps);
-  let data = await encode(inst, item, { out, vbps, hasAudio, label: 'Encoding' });
-  if (data.length > MAX_BYTES) {
-    vbps *= (target / data.length) * 0.92;
-    out = outputSize(src, vbps, fps);
-    data = await encode(inst, item, { out, vbps, hasAudio, label: 'Too big, re-encoding at a lower bitrate' });
-  }
-  if (data.length > MAX_BYTES) throw new Error("Couldn't get the clip under 20 MB. Try a shorter selection.");
-  const best = { data, out };
-
-  item.state = 'done';
-  item.url = URL.createObjectURL(new Blob([best.data], { type: 'video/mp4' }));
-  item.info = `${(best.data.length / 1e6).toFixed(1)} MB · ${fmtLen(dur)} · ${best.out.w}×${best.out.h}`;
-  renderItem(item);
+  return encodeToSize(item, target, fps, hasAudio,
+    (out, vbps, label) => encode(inst, item, { out, vbps, hasAudio, label }));
 }
 
 async function encode(inst, item, { out, vbps, hasAudio, label }) {
@@ -584,10 +669,7 @@ async function encode(inst, item, { out, vbps, hasAudio, label }) {
     const m = msg.match(/time=(\d+):(\d+):([\d.]+)/);
     if (!m) return;
     const frac = clamp((+m[1] * 3600 + +m[2] * 60 + +m[3]) / dur, 0, 1);
-    const elapsed = (performance.now() - t0) / 1000;
-    const left = frac > 0.03 ? Math.round(elapsed / frac - elapsed) : null;
-    const eta = left == null ? '' : left >= 60 ? ` · about ${Math.ceil(left / 60)} min left` : ` · ${left}s left`;
-    setItem(item, `${label}… ${Math.round(frac * 100)}%${eta}`, frac);
+    setItem(item, `${label}… ${Math.round(frac * 100)}%${etaText(t0, frac)}`, frac);
   };
 
   logLines = [];
