@@ -592,7 +592,7 @@ async function runWebCodecs(item, target, alive) {
 
   const cropOn = src.w !== W || src.h !== H;
   return encodeToSize(item, target, fps, hasAudio, async (out, vbps, label) => {
-    if (!(await canEncodeVideo('avc', { width: out.w, height: out.h, bitrate: vbps }))) {
+    if (!(await canEncodeVideo('avc', { width: out.w, height: out.h, bitrate: Math.round(vbps) }))) {
       throw new Error(`can't encode H.264 at ${out.w}×${out.h}`);
     }
     const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
