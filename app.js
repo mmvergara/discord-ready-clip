@@ -27,7 +27,7 @@ let webCodecsOK = typeof VideoEncoder === 'function';
 const TARGET_BYTES = 19.4e6; // aim just under the limit
 const MAX_BYTES = 20e6;      // never exceed 20 MB
 const AUDIO_BPS = 128e3;
-const MIN_BPP = 0.06;        // below this many bits/pixel/frame, downscale instead of starving quality
+const MIN_BPP = 0.035;       // below this many bits/pixel/frame, downscale instead of starving quality (keeps 1080p60 at ~5 Mbps)
 const MIN_HEIGHT = 360;
 const MIN_CLIP = 0.5;
 
@@ -387,8 +387,8 @@ async function probe(inst, file) {
 const cropOnFor = (item) => item.src.w !== even(item.W) || item.src.h !== even(item.H);
 
 function videoBitrateFor(dur, hasAudio, target) {
-  const totalBps = (target * 8 * 0.995) / dur; // MP4 overhead measured at well under 1%
-  return Math.max(150e3, totalBps - (hasAudio ? AUDIO_BPS : 0));
+  const totalBps = (target * 8 * 0.985) / dur; // leave a little room for MP4 overhead
+  return Math.max(300e3, totalBps - (hasAudio ? AUDIO_BPS : 0));
 }
 
 // Keep the crop's resolution unless the bitrate is too thin for it, then scale down just enough.
@@ -532,8 +532,8 @@ async function runItem(item) {
     return renderItem(item);
   }
 
-  // Never inflate: a clip of a small file only gets about as many bytes as that part had in the original.
-  const target = Math.min(TARGET_BYTES, Math.max(1e6, item.file.size * (dur / item.srcDur) * 1.1));
+  // Always spend the whole budget, however many bytes that part of the original used.
+  const target = TARGET_BYTES;
   const alive = () => { if (item.state === 'cancelled') throw new Error('cancelled'); };
 
   let best = null;
@@ -607,7 +607,7 @@ async function runWebCodecs(item, target, alive) {
       video: {
         codec: 'avc', forceTranscode: true, fit: 'fill', width: out.w, height: out.h,
         ...(cropOn ? { crop: { left: src.x, top: src.y, width: src.w, height: src.h } } : {}),
-        quality: new Quality({ bitrate: Math.round(vbps), bitrateMode: 'constant' }),
+        quality: new Quality({ bitrate: Math.round(vbps), bitrateMode: 'variable' }),
       },
       audio: hasAudio
         ? { codec: 'aac', numberOfChannels: 2, quality: new Quality({ bitrate: AUDIO_BPS }) }
@@ -662,7 +662,7 @@ async function encode(inst, item, { out, vbps, hasAudio, label }) {
     '-map', '0:v:0', ...(hasAudio ? ['-map', '0:a:0?'] : []),
     '-vf', filters.join(','),
     ...(useMT ? ['-threads', THREADS] : []),
-    '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
+    '-c:v', 'libx264', '-preset', 'fast', '-profile:v', 'high', '-pix_fmt', 'yuv420p',
     '-b:v', `${k}k`, '-maxrate', `${Math.round(k * 1.5)}k`, '-bufsize', `${k * 2}k`,
     ...(hasAudio ? ['-c:a', 'aac', '-b:a', `${AUDIO_BPS / 1000}k`, '-ac', '2'] : []),
     '-movflags', '+faststart', '-y', '/out.mp4',
