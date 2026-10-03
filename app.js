@@ -24,7 +24,7 @@ const MEDIABUNNY_URL = 'https://cdn.jsdelivr.net/npm/mediabunny@1.61.0/dist/bund
 let mediabunny = null;
 let webCodecsOK = typeof VideoEncoder === 'function';
 
-const TARGET_BYTES = 18e6;   // aim for ~18 MB
+const TARGET_BYTES = 19.4e6; // aim just under the limit
 const MAX_BYTES = 20e6;      // never exceed 20 MB
 const AUDIO_BPS = 128e3;
 const MIN_BPP = 0.06;        // below this many bits/pixel/frame, downscale instead of starving quality
@@ -557,19 +557,24 @@ async function runItem(item) {
 
 class SizeError extends Error {}
 
-// Encodes once at the bitrate that should land near `target`; if that overshoots MAX_BYTES, retries once
-// at a bitrate scaled down by how far over it went. `encodeAt` returns the file bytes.
+// Encodes at the bitrate that should land near `target`, then corrects once by how far off it landed:
+// down if it went over MAX_BYTES, up if it wasted a lot of the space (hardware encoders often undershoot).
+// `encodeAt` returns the file bytes.
+const UNDERSHOOT = 0.85;
 async function encodeToSize(item, target, fps, hasAudio, encodeAt) {
   let vbps = videoBitrateFor(item.dur, hasAudio, target);
   let out = outputSize(item.src, vbps, fps);
-  let data = await encodeAt(out, vbps, 'Encoding');
-  if (data.length > MAX_BYTES) {
-    vbps *= (target / data.length) * 0.92;
-    out = outputSize(item.src, vbps, fps);
-    data = await encodeAt(out, vbps, 'Too big, re-encoding at a lower bitrate');
-  }
-  if (data.length > MAX_BYTES) throw new SizeError("Couldn't get the clip under 20 MB. Try a shorter selection.");
-  return { data, out };
+  const first = { data: await encodeAt(out, vbps, 'Encoding'), out };
+  const over = first.data.length > MAX_BYTES;
+  if (!over && first.data.length >= target * UNDERSHOOT) return first;
+
+  vbps *= (target / first.data.length) * (over ? 0.92 : 0.97);
+  out = outputSize(item.src, vbps, fps);
+  const label = over ? 'Too big, re-encoding at a lower bitrate' : 'Using the leftover space for better quality, re-encoding';
+  const second = { data: await encodeAt(out, vbps, label), out };
+  if (second.data.length <= MAX_BYTES) return second;
+  if (!over) return first;
+  throw new SizeError("Couldn't get the clip under 20 MB. Try a shorter selection.");
 }
 
 // Returns null when this browser can't encode the clip with WebCodecs.
@@ -602,7 +607,7 @@ async function runWebCodecs(item, target, alive) {
       video: {
         codec: 'avc', forceTranscode: true, fit: 'fill', width: out.w, height: out.h,
         ...(cropOn ? { crop: { left: src.x, top: src.y, width: src.w, height: src.h } } : {}),
-        quality: new Quality({ bitrate: Math.round(vbps), bitrateMode: 'variable' }),
+        quality: new Quality({ bitrate: Math.round(vbps), bitrateMode: 'constant' }),
       },
       audio: hasAudio
         ? { codec: 'aac', numberOfChannels: 2, quality: new Quality({ bitrate: AUDIO_BPS }) }
