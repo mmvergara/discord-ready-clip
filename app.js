@@ -10,7 +10,13 @@ const CORES = {
 // The mt core pre-spawns 32 pthreads; x264's automatic thread count can exceed that and hang, so cap it.
 const THREADS = String(Math.max(2, Math.min(8, navigator.hardwareConcurrency || 4)));
 const STALL_MS = 45000;      // no ffmpeg output for this long = assume the mt core deadlocked
-let useMT = self.crossOriginIsolated === true;
+const LOAD_MS = 30000;      // core downloaded but load() still hasn't finished = assume the mt core hung
+const MT_FAILED_KEY = 'mtFailed';
+let useMT = self.crossOriginIsolated === true && !readMTFailed();
+
+function readMTFailed() {
+  try { return localStorage.getItem(MT_FAILED_KEY) === '1'; } catch { return false; }
+}
 
 const TARGET_BYTES = 18e6;   // aim for ~18 MB
 const MAX_BYTES = 20e6;      // never exceed 20 MB
@@ -311,7 +317,17 @@ function loadFFmpeg() {
       if (logLines.length > 300) logLines.shift();
       onProgressLine?.(message);
     });
-    await inst.load(workerURL ? { coreURL, wasmURL, workerURL } : { coreURL, wasmURL });
+    const loading = inst.load(workerURL ? { coreURL, wasmURL, workerURL } : { coreURL, wasmURL });
+    if (useMT) {
+      // The mt core can hang inside load() without ever rejecting, so race it against a timeout.
+      let timer;
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new StallError('load stalled')), LOAD_MS); });
+      try { await Promise.race([loading, timeout]); }
+      catch (err) { inst.terminate(); throw err; }
+      finally { clearTimeout(timer); }
+    } else {
+      await loading;
+    }
     ff = inst;
     mounted = null;
     return inst;
@@ -485,6 +501,7 @@ async function pump() {
       // Multi-threaded core hung or wouldn't start: switch to the single-threaded core and redo this clip.
       console.warn('Multi-threaded ffmpeg failed, falling back to single-threaded:', err);
       useMT = false;
+      try { localStorage.setItem(MT_FAILED_KEY, '1'); } catch {}
       killFFmpeg();
       item.state = 'waiting';
     } else {
